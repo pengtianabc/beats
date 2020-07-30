@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"runtime"
 	"strconv"
+	"strings"
 
-	"github.com/tsg/gopacket/pcap"
+	"github.com/google/gopacket/pcap"
 
 	"github.com/elastic/beats/v7/libbeat/logp"
 )
@@ -73,11 +74,17 @@ func ListDeviceNames(withDescription bool, withIP bool) ([]string, error) {
 	return ret, nil
 }
 
-func resolveDeviceName(name string) (string, error) {
+func resolveDeviceName(name string, dev_type string) (string, error) {
 	if name == "" {
 		return "any", nil
 	}
-
+	var suffix string
+	if (dev_type == "pfring" || dev_type == "pf_ring") {
+		lst := strings.Split(name, "@")
+		if len(lst) == 2 {
+			suffix = fmt.Sprintf("@%s", lst[1])
+		}
+	}
 	if index, err := strconv.Atoi(name); err == nil { // Device is numeric id
 		devices, err := ListDeviceNames(false, false)
 		if err != nil {
@@ -92,7 +99,7 @@ func resolveDeviceName(name string) (string, error) {
 		logp.Info("Resolved device index %d to device: %s", index, name)
 	}
 
-	return name, nil
+	return fmt.Sprintf("%s%s", name, suffix), nil
 }
 
 func deviceNameFromIndex(index int, devices []string) (string, error) {

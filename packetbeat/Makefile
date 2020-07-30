@@ -7,6 +7,10 @@ EXCLUDE_COMMON_UPDATE_TARGET=true
 
 include ${ES_BEATS}/libbeat/scripts/Makefile
 
+.PHONY: with_pfring
+with_pfring:
+	go build --tags havepfring
+
 .PHONY: update
 update: mage
 	mage update

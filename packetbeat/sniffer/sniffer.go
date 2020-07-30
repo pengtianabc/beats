@@ -24,10 +24,9 @@ import (
 	"runtime"
 	"syscall"
 	"time"
-
-	"github.com/tsg/gopacket"
-	"github.com/tsg/gopacket/layers"
-	"github.com/tsg/gopacket/pcap"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 
 	"github.com/elastic/beats/v7/libbeat/common/atomic"
 	"github.com/elastic/beats/v7/libbeat/logp"
@@ -39,7 +38,7 @@ import (
 // to a Worker.
 type Sniffer struct {
 	config config.InterfacesConfig
-	dumper *pcap.Dumper
+	h *pcap.Handle
 
 	state atomic.Int32 // store snifferState
 
@@ -106,7 +105,7 @@ func New(
 		s.config.Device = ""
 	} else {
 		// try to resolve device name (ignore error if testMode is enabled)
-		if name, err := resolveDeviceName(s.config.Device); err != nil {
+		if name, err := resolveDeviceName(s.config.Device, s.config.Type); err != nil {
 			if !testMode {
 				return nil, err
 			}
@@ -143,7 +142,7 @@ func New(
 func (s *Sniffer) Run() error {
 	var (
 		counter = 0
-		dumper  *pcap.Dumper
+		h  *pcap.Handle
 	)
 
 	handle, err := s.open()
@@ -153,12 +152,12 @@ func (s *Sniffer) Run() error {
 	defer handle.Close()
 
 	if s.config.Dumpfile != "" {
-		dumper, err = openDumper(s.config.Dumpfile, handle.LinkType())
+		h, err = openDumper(s.config.Dumpfile, handle.LinkType())
 		if err != nil {
 			return err
 		}
 
-		defer dumper.Close()
+		defer h.Close()
 	}
 
 	worker, err := s.factory(handle.LinkType())
@@ -179,7 +178,7 @@ func (s *Sniffer) Run() error {
 			fmt.Println("Press enter to read packet")
 			fmt.Scanln()
 		}
-
+		logp.Debug("sniffer", "ReadPacketData")
 		data, ci, err := handle.ReadPacketData()
 		if err == pcap.NextErrorTimeoutExpired || err == syscall.EINTR {
 			logp.Debug("sniffer", "Interrupted")
@@ -197,12 +196,13 @@ func (s *Sniffer) Run() error {
 		}
 
 		if len(data) == 0 {
+			logp.Debug("sniffer", "continue because of data is empty")
 			// Empty packet, probably timeout from afpacket
 			continue
 		}
 
-		if dumper != nil {
-			dumper.WritePacketData(data, ci)
+		if h != nil {
+			h.WritePacketData(data)
 		}
 
 		counter++
@@ -223,6 +223,8 @@ func (s *Sniffer) open() (snifferHandle, error) {
 		return openPcap(s.filter, &s.config)
 	case "af_packet":
 		return openAFPacket(s.filter, &s.config)
+	case "pfring", "pf_ring"	:
+		return openPfringPacket(s.filter, &s.config)
 	default:
 		return nil, fmt.Errorf("Unknown sniffer type: %s", s.config.Type)
 	}
@@ -232,6 +234,19 @@ func (s *Sniffer) open() (snifferHandle, error) {
 // signal has been given.
 func (s *Sniffer) Stop() error {
 	s.state.Store(snifferClosing)
+	delay_sec := 4
+	// force quit because pfring timeout not implemented in gopacket
+	// https://github.com/google/gopacket/issues/805
+	go func() {
+		ticker := time.NewTicker(time.Duration(delay_sec) * time.Second)
+		for {
+			select {
+				case <- ticker.C:
+					logp.Warn("Force close handle because of timeout(%d second)", delay_sec)
+					os.Exit(0)
+			}
+		}
+	}()
 	return nil
 }
 
@@ -247,6 +262,8 @@ func validateConfig(filter string, cfg *config.InterfacesConfig) error {
 		return validatePcapConfig(cfg)
 	case "af_packet":
 		return validateAfPacketConfig(cfg)
+	case "pfring", "pf_ring":
+		return validatePfringConfig(cfg)
 	default:
 		return fmt.Errorf("Unknown sniffer type: %s", cfg.Type)
 	}
@@ -261,20 +278,15 @@ func validateAfPacketConfig(cfg *config.InterfacesConfig) error {
 	return err
 }
 
+func validatePfringConfig(cfg *config.InterfacesConfig) error {
+	return nil
+}
+
 func validatePcapFilter(expr string) error {
 	if expr == "" {
 		return nil
 	}
-
-	// Open a dummy pcap handle to compile the filter
-	p, err := pcap.OpenDead(layers.LinkTypeEthernet, 65535)
-	if err != nil {
-		return fmt.Errorf("OpenDead: %s", err)
-	}
-
-	defer p.Close()
-
-	_, err = p.NewBPF(expr)
+	_, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, 65535, expr)
 	if err != nil {
 		return fmt.Errorf("invalid filter '%s': %v", expr, err)
 	}
@@ -305,12 +317,12 @@ func openAFPacket(filter string, cfg *config.InterfacesConfig) (snifferHandle, e
 	}
 
 	timeout := 500 * time.Millisecond
-	h, err := newAfpacketHandle(cfg.Device, szFrame, szBlock, numBlocks, timeout, cfg.EnableAutoPromiscMode)
+	h, err := newAfpacketHandle(cfg.Device, szFrame, szBlock, numBlocks, timeout, cfg.EnableAutoPromiscMode, cfg.WithVlans)
 	if err != nil {
 		return nil, err
 	}
 
-	err = h.SetBPFFilter(filter)
+	err = h.SetBPFFilter(filter, cfg.Snaplen)
 	if err != nil {
 		h.Close()
 		return nil, err
@@ -319,11 +331,50 @@ func openAFPacket(filter string, cfg *config.InterfacesConfig) (snifferHandle, e
 	return h, nil
 }
 
-func openDumper(file string, linkType layers.LinkType) (*pcap.Dumper, error) {
-	p, err := pcap.OpenDead(linkType, 65535)
+func openPfringPacket(filter string, cfg *config.InterfacesConfig) (snifferHandle, error) {
+	snaplen := int(cfg.Snaplen)
+	h, err := newPfringHandle(cfg.Device, snaplen, cfg.EnableAutoPromiscMode, cfg.ZeroCopy)
+	if err != nil {
+		logp.Warn("pfring", "Cant create pfring handle")
+		return nil, err
+	}
+	err = h.PrepareHandle()
+	if err != nil {
+		logp.Warn("pfring", "Cant prepare pfring handle")
+		return nil, err
+	}
+	if cfg.ClusterId >= 0 {
+		logp.Debug("pfring", "Setting pfring cluster, cluster_id: %d cluster_type: %d", cfg.ClusterId, cfg.ClusterType)
+		err = h.SetCluster(cfg.ClusterId, cfg.ClusterType)
+		if err != nil {
+			h.Close()
+			logp.Warn("pfring", "Cant set pfring cluster, cluster_id: %d cluster_type: %d", cfg.ClusterId, cfg.ClusterType)
+			return nil, err
+		}
+	}
+	err = h.SetBPFFilter(filter)
+	if err != nil {
+		h.Close()
+		logp.Warn("pfring", "Cant set pfring bpf filter: %s", filter)
+		return nil, err
+	}
+	if err = h.Enable(); err != nil {
+		h.Close()
+		logp.Warn("pfring", "Cant set pfring interface up: %s", cfg.Device)
+		return nil, err
+	}
+	return h, nil
+}
+
+func openDumper(file string, linkType layers.LinkType) (*pcap.Handle, error) {
+	h, err := pcap.OpenOffline(file)
 	if err != nil {
 		return nil, err
 	}
-
-	return p.NewDumper(file)
+	err = h.SetLinkType(linkType)
+	if err != nil {
+		h.Close()
+		return nil, err
+	}
+	return h, nil
 }

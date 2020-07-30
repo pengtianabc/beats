@@ -41,6 +41,9 @@ type InterfacesConfig struct {
 	File                  string `config:"file"`
 	WithVlans             bool   `config:"with_vlans"`
 	BpfFilter             string `config:"bpf_filter"`
+	ZeroCopy              bool   `config:"zero_copy"`
+	ClusterId             int    `config:"cluster_id"`
+	ClusterType           int    `config:"cluster_type"`
 	Snaplen               int    `config:"snaplen"`
 	BufferSizeMb          int    `config:"buffer_size_mb"`
 	EnableAutoPromiscMode bool   `config:"auto_promisc_mode"`

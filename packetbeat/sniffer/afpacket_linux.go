@@ -27,9 +27,11 @@ import (
 
 	"github.com/elastic/beats/v7/libbeat/logp"
 
-	"github.com/tsg/gopacket"
-	"github.com/tsg/gopacket/afpacket"
-	"github.com/tsg/gopacket/layers"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/afpacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
+	"golang.org/x/net/bpf"
 )
 
 type afpacketHandle struct {
@@ -40,7 +42,7 @@ type afpacketHandle struct {
 }
 
 func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks int,
-	timeout time.Duration, autoPromiscMode bool) (*afpacketHandle, error) {
+	timeout time.Duration, autoPromiscMode bool, useVLAN bool) (*afpacketHandle, error) {
 
 	var err error
 	var promiscEnabled bool
@@ -69,25 +71,53 @@ func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks in
 			afpacket.OptFrameSize(snaplen),
 			afpacket.OptBlockSize(block_size),
 			afpacket.OptNumBlocks(num_blocks),
-			afpacket.OptPollTimeout(timeout))
+			afpacket.OptAddVLANHeader(useVLAN),
+			afpacket.OptPollTimeout(timeout),
+			afpacket.SocketRaw,
+			afpacket.TPacketVersion3)
 	} else {
 		h.TPacket, err = afpacket.NewTPacket(
 			afpacket.OptInterface(device),
 			afpacket.OptFrameSize(snaplen),
 			afpacket.OptBlockSize(block_size),
 			afpacket.OptNumBlocks(num_blocks),
-			afpacket.OptPollTimeout(timeout))
+			afpacket.OptAddVLANHeader(useVLAN),
+			afpacket.OptPollTimeout(timeout),
+			afpacket.SocketRaw,
+			afpacket.TPacketVersion3)
 	}
-
 	return h, err
+}
+
+// ZeroCopyReadPacketData satisfies ZeroCopyPacketDataSource interface
+func (h *afpacketHandle) ZeroCopyReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error) {
+	return h.TPacket.ZeroCopyReadPacketData()
 }
 
 func (h *afpacketHandle) ReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error) {
 	return h.TPacket.ReadPacketData()
 }
 
-func (h *afpacketHandle) SetBPFFilter(expr string) (_ error) {
-	return h.TPacket.SetBPFFilter(expr)
+// SetBPFFilter translates a BPF filter string into BPF RawInstruction and applies them.
+func (h *afpacketHandle) SetBPFFilter(filter string, snaplen int) (err error) {
+	pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, snaplen, filter)
+	if err != nil {
+		return err
+	}
+	bpfIns := []bpf.RawInstruction{}
+	for _, ins := range pcapBPF {
+		bpfIns2 := bpf.RawInstruction{
+			Op: ins.Code,
+			Jt: ins.Jt,
+			Jf: ins.Jf,
+			K:  ins.K,
+		}
+		bpfIns = append(bpfIns, bpfIns2)
+	}
+	if h.TPacket.SetBPF(bpfIns); err != nil {
+		return err
+	}
+	return h.TPacket.SetBPF(bpfIns)
 }
 
 func (h *afpacketHandle) LinkType() layers.LinkType {
